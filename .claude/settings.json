@@ -3,6 +3,9 @@
     "youtube-transcript": {
       "command": "node",
       "args": ["/home/user/ramil_fit/mcp-server-youtube-transcript/dist/index.js"]
+    },
+    "youtube-transcript-fabriqa": {
+      "command": "youtube-transcript-mcp"
     }
   }
 }
