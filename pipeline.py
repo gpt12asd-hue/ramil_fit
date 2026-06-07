@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""YouTube subtitle extraction and Claude analysis pipeline."""
+"""YouTube subtitle extraction and Claude analysis pipeline.
+
+Subtitle backends:
+  --backend=api   (default) youtube-transcript-api Python library
+  --backend=mcp   kimtaeyoon83/mcp-server-youtube-transcript via subprocess
+"""
 
 import json
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -10,31 +16,19 @@ from pathlib import Path
 import anthropic
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 
+MCP_SERVER_PATH = Path(__file__).parent / "mcp-server-youtube-transcript" / "dist" / "index.js"
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
 
 def extract_video_id(url: str) -> str:
-    patterns = [
-        r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    raise ValueError(f"Could not extract video ID from URL: {url}")
-
-
-def fetch_subtitles(video_id: str) -> tuple[list[dict], str]:
-    """Returns (transcript_entries, language_code)."""
-    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-
-    # prefer manual transcripts, then auto-generated
-    for priority in ("manual", "generated"):
-        for transcript in transcript_list:
-            if priority == "manual" and not transcript.is_generated:
-                return transcript.fetch(), transcript.language_code
-            if priority == "generated" and transcript.is_generated:
-                return transcript.fetch(), transcript.language_code
-
-    raise NoTranscriptFound(video_id, [], [])
+    match = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})", url)
+    if match:
+        return match.group(1)
+    # bare 11-char ID passed directly
+    if re.fullmatch(r"[a-zA-Z0-9_-]{11}", url):
+        return url
+    raise ValueError(f"Could not extract video ID from: {url}")
 
 
 def format_transcript(entries: list[dict]) -> str:
@@ -49,6 +43,81 @@ def format_transcript(entries: list[dict]) -> str:
             lines.append(f"[{ts}] {text}")
     return "\n".join(lines)
 
+
+# ── backend: youtube-transcript-api ───────────────────────────────────────────
+
+def fetch_via_api(video_id: str) -> tuple[str, str]:
+    """Returns (formatted_transcript, language_code)."""
+    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    for priority in ("manual", "generated"):
+        for t in transcript_list:
+            if priority == "manual" and not t.is_generated:
+                return format_transcript(t.fetch()), t.language_code
+            if priority == "generated" and t.is_generated:
+                return format_transcript(t.fetch()), t.language_code
+    raise NoTranscriptFound(video_id, [], [])
+
+
+# ── backend: MCP server ────────────────────────────────────────────────────────
+
+def _mcp_rpc(request: dict) -> dict:
+    """Send one JSON-RPC request to the MCP server over stdio, return response."""
+    proc = subprocess.run(
+        ["node", str(MCP_SERVER_PATH)],
+        input=json.dumps(request) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            if "result" in data or "error" in data:
+                return data
+        except json.JSONDecodeError:
+            continue
+    raise RuntimeError(f"MCP server returned no parseable response.\nstdout: {proc.stdout}\nstderr: {proc.stderr}")
+
+
+def fetch_via_mcp(url: str, lang: str = "en") -> tuple[str, str]:
+    """Returns (formatted_transcript, language_code)."""
+    if not MCP_SERVER_PATH.exists():
+        raise FileNotFoundError(
+            f"MCP server not built at {MCP_SERVER_PATH}. "
+            "Run: cd mcp-server-youtube-transcript && npm install && npm run build"
+        )
+
+    # MCP initialize handshake
+    _mcp_rpc({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "pipeline", "version": "1.0"},
+        },
+    })
+
+    # call get_transcript tool
+    response = _mcp_rpc({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "get_transcript",
+            "arguments": {"url": url, "lang": lang, "include_timestamps": True, "strip_ads": True},
+        },
+    })
+
+    if "error" in response:
+        raise RuntimeError(f"MCP error: {response['error']}")
+
+    content_blocks = response.get("result", {}).get("content", [])
+    text = "\n".join(b.get("text", "") for b in content_blocks if b.get("type") == "text")
+    return text, lang
+
+
+# ── Claude analysis ────────────────────────────────────────────────────────────
 
 def analyze_with_claude(transcript_text: str, video_url: str) -> str:
     client = anthropic.Anthropic()
@@ -77,23 +146,30 @@ Transcript:
         for text in stream.text_stream:
             print(text, end="", flush=True)
             chunks.append(text)
-        print()  # newline after stream
+        print()
 
     return "".join(chunks)
 
+
+# ── save ───────────────────────────────────────────────────────────────────────
 
 def save_results(output: dict, output_path: Path) -> None:
     output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2))
     print(f"\nResults saved to: {output_path}")
 
 
-def run(url: str, output_dir: str = "output") -> Path:
+# ── main ───────────────────────────────────────────────────────────────────────
+
+def run(url: str, output_dir: str = "output", backend: str = "api", lang: str = "en") -> Path:
     video_id = extract_video_id(url)
-    print(f"Video ID: {video_id}")
+    print(f"Video ID: {video_id}  |  backend: {backend}")
 
     print("Fetching subtitles...")
     try:
-        entries, lang = fetch_subtitles(video_id)
+        if backend == "mcp":
+            transcript_text, lang_used = fetch_via_mcp(url, lang)
+        else:
+            transcript_text, lang_used = fetch_via_api(video_id)
     except TranscriptsDisabled:
         print("ERROR: Subtitles are disabled for this video.")
         sys.exit(1)
@@ -101,15 +177,14 @@ def run(url: str, output_dir: str = "output") -> Path:
         print("ERROR: No transcript found for this video.")
         sys.exit(1)
 
-    print(f"Found transcript in language: {lang} ({len(entries)} segments)")
-    transcript_text = format_transcript(entries)
-
+    print(f"Language: {lang_used}")
     analysis = analyze_with_claude(transcript_text, url)
 
     result = {
         "url": url,
         "video_id": video_id,
-        "language": lang,
+        "language": lang_used,
+        "backend": backend,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "transcript": transcript_text,
         "analysis": analysis,
@@ -123,11 +198,18 @@ def run(url: str, output_dir: str = "output") -> Path:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python pipeline.py <youtube_url> [output_dir]")
-        print("Example: python pipeline.py 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'")
-        sys.exit(1)
+    import argparse
 
-    youtube_url = sys.argv[1]
-    out_directory = sys.argv[2] if len(sys.argv) > 2 else "output"
-    run(youtube_url, out_directory)
+    parser = argparse.ArgumentParser(description="YouTube → subtitles → Claude analysis")
+    parser.add_argument("url", help="YouTube URL or video ID")
+    parser.add_argument("--output-dir", default="output", help="Output directory (default: output)")
+    parser.add_argument(
+        "--backend",
+        choices=["api", "mcp"],
+        default="api",
+        help="Subtitle backend: api (youtube-transcript-api) or mcp (kimtaeyoon83 MCP server)",
+    )
+    parser.add_argument("--lang", default="en", help="Language code for MCP backend (default: en)")
+    args = parser.parse_args()
+
+    run(args.url, args.output_dir, args.backend, args.lang)

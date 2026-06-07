@@ -1,0 +1,4 @@
+output/
+mcp-server-youtube-transcript/node_modules/
+__pycache__/
+*.pyc
